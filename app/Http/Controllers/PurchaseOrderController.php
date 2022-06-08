@@ -4,11 +4,14 @@ namespace App\Http\Controllers;
 
 use App\Http\Requests\PurchaseOrderCreateRequest;
 use App\Http\Requests\PurchaseOrderUpdateRequest;
-use App\Models\Product;
+use App\Exports\PurchaseOrderExports;
 use App\Models\PurchaseOrder;
 use App\Models\PurchaseOrderItem;
 use Carbon\Carbon;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
+use Maatwebsite\Excel\Facades\Excel;
 
 class PurchaseOrderController extends Controller
 {
@@ -19,9 +22,60 @@ class PurchaseOrderController extends Controller
      *
      * @return \Illuminate\Http\Response
      */
-    public function index()
+    public function index(Request $request)
     {
-        $purchaseOrders = PurchaseOrder::orderBy('updated_at')->paginate(20);
+        if ($request->has('export')) {
+            return Excel::download(new PurchaseOrderExports, Carbon::now()->format('Y-m-d') . ' - Purchase Orders.xlsx');
+        }
+
+        $query = "
+            purchase_orders.*,
+            users.name as userName,
+            GROUP_CONCAT(purchase_order_items.modelCode SEPARATOR ' ') as modelCode,
+            SUM(purchase_order_items.orderQuantity) as orderQuantity,
+            SUM(purchase_order_items.invoiceQuantity) as invoiceQuantity,
+            SUM(purchase_order_items.invoicePrice) as invoicePrice,
+            SUM(purchase_order_items.totalPrice) as totalPrice
+        ";
+
+        switch (getenv('DB_CONNECTION')) {
+            case "pgsql":
+                $query = "
+                    purchase_orders.*,
+                    users.name as userName,
+                    STRING_AGG(lower('purchase_order_items.modelCode'), ', ') as modelCode,
+                    SUM(lower('purchase_order_items.orderQuantity'))::DOUBLE PRECISION as orderQuantity,
+                    SUM(lower('purchase_order_items.invoiceQuantity'))::DOUBLE PRECISION as invoiceQuantity,
+                    SUM(lower('purchase_order_items.invoicePrice'))::DOUBLE PRECISION as invoicePrice,
+                    SUM(lower('purchase_order_items.totalPrice'))::DOUBLE PRECISION as totalPrice
+                ";
+                break;
+        }
+        $purchaseOrders = DB::table('purchase_orders')
+            ->select(
+                DB::raw($query)
+            )
+            ->join('purchase_order_items', 'purchase_order_items.purchase_order_id', '=', 'purchase_orders.id')
+            ->join('users', 'users.id', '=', 'purchase_orders.update_by', 'left')
+            ->groupBy('purchase_orders.id');
+        if ($request->has('keyword')) {
+            $keyword = $request->get('keyword');
+            $purchaseOrders = $purchaseOrders
+                ->where(function ($query) use ($keyword) {
+                    $query->where('poNumber', 'like', '%'.$keyword.'%')
+                        ->orWhere('siteCode', 'like', '%'.$keyword.'%')
+                        ->orWhere('orderDate', 'like', '%'.$keyword.'%')
+                        ->orWhere('deliveryMode', 'like', '%'.$keyword.'%')
+                        ->orWhere('paymentMethod', 'like', '%'.$keyword.'%')
+                        ->orWhere('sales_order', 'like', '%'.$keyword.'%')
+                        ->orWhere('comment', 'like', '%'.$keyword.'%')
+                        ->orWhere('billing_document', 'like', '%'.$keyword.'%')
+                        ;
+                });
+        }
+        
+        $purchaseOrders = $purchaseOrders->paginate($request->get('limit', 100));
+
         return view('samsung.purchase-order.index', compact('purchaseOrders'));
     }
 
@@ -33,6 +87,7 @@ class PurchaseOrderController extends Controller
      */
     public function store(PurchaseOrderCreateRequest $request)
     {
+        $userId = auth()->user()->id;
         $purcaseOrder = PurchaseOrder::updateOrCreate(
             ["poNumber" => $request->get('poNumber')],
             [
@@ -43,20 +98,17 @@ class PurchaseOrderController extends Controller
                 "comment" => $request->get('comment'),
                 "sales_order" => $request->get('sales_order'),
                 "api_order_id" => $request->get('api_order_id'),
+                "update_by" => $userId
             ]
         );
 
         $purchaseOrderId = $purcaseOrder->id;
-        foreach ($request->get('items') as $key => $value) {
+        foreach ($request->get('items') as $value) {
             $price = doubleval($value['price']);
             $discount = doubleval($value['discount']);
             $quantity = intval($value['orderQuantity']);
             $discountedPrice = !empty($value['discountedPrice']) ? $value['discountedPrice'] : $price - $discount;
             $totalPrice = !empty($value['totalPrice']) ? $value['totalPrice'] : $discountedPrice * $quantity;
-
-            Product::firstOrCreate([
-                "modelCode" => $value['modelCode']
-            ]);
             
             PurchaseOrderItem::create(
                 [
@@ -68,7 +120,8 @@ class PurchaseOrderController extends Controller
                     'discountedPrice' => $discountedPrice,
                     'totalPrice' => $totalPrice,
                     'taxcode' => $value['taxcode'],
-                    'modelCode' => $value['modelCode']
+                    'modelCode' => $value['modelCode'],
+                    "update_by" => $userId
                 ]
             );
         }
@@ -170,6 +223,7 @@ class PurchaseOrderController extends Controller
         $purchaseOrder->date_sent = Carbon::now()->format('Y-m-d');
         $purchaseOrder->status = $payload['status'];
         $purchaseOrder->remarks = $payload['remarks'];
+        $purchaseOrder->update_by = auth()->user()->id;
 
         $purchaseOrder->save();
 
@@ -191,6 +245,7 @@ class PurchaseOrderController extends Controller
             $purchaseOrderItem->taxcode = $purchaseItem['taxcode'];
             $purchaseOrderItem->totalPrice = $totalPrice;
             $purchaseOrderItem->deliveryDate = $deliveryDate;
+            $purchaseOrderItem->update_by = auth()->user()->id;
 
             $purchaseOrderItem->save();
         }
